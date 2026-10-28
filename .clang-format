@@ -1,0 +1,59 @@
+---
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+Standard: Latest
+MaxEmptyLinesToKeep: 1
+ColumnLimit: 120
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^".*pb.h'
+    Priority: 2
+  - Regex: '^"Robot/.*.hpp'
+    Priority: 3
+  - Regex: '^"Services/.*.hpp'
+    Priority: 4
+  - Regex: '^"Features/.*.hpp'
+    Priority: 5
+  - Regex: '^"IO/.*.hpp'
+    Priority: 6
+  - Regex: '^"Common/.*.hpp'
+    Priority: 7
+  - Regex: '^<.*.hpp>'
+    Priority: 8
+  - Regex: '^<.*.h>'
+    Priority: 9
+  - Regex: '^<.*>'
+    Priority: 10
+  - Regex: '^".*.hpp"'
+    Priority: 1
+
+AlignArrayOfStructures: Right
+AlignEscapedNewlines: Right
+AlwaysBreakTemplateDeclarations: Yes
+BraceWrapping:
+  AfterClass: false
+  AfterStruct: false
+  AfterEnum: false
+  AfterCaseLabel: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterExternBlock: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  BeforeWhile: false
+  BeforeLambdaBody: false
+  SplitEmptyFunction: false
+  SplitEmptyNamespace: false
+  SplitEmptyRecord: false
+
+QualifierAlignment: Custom
+QualifierOrder: [ inline, static, constexpr, const, volatile, friend, type ]
+
+InsertNewlineAtEOF: true
+
+IndentRequiresClause: false
+RequiresClausePosition: OwnLine
+---
+

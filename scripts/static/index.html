@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>WebRTC H.264 Stream</title>
+    <style>
+        body { font-family: sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
+        #video { width: 100%; max-width: 1280px; background: #000; border: 1px solid #333; }
+        #status { margin-top: 10px; padding: 10px; background: #222; border-radius: 4px; font-family: monospace; }
+        #log { margin-top: 10px; max-height: 350px; overflow-y: auto; background: #1a1a1a; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+        #log div { white-space: pre-wrap; padding: 1px 0; }
+        .error { color: #ff6b6b; }
+        .ok { color: #6bffb3; }
+        .warn { color: #ffd93d; }
+    </style>
+</head>
+<body>
+<h1>WebRTC H.264 Stream</h1>
+<video id="video" autoplay playsinline muted></video>
+<div id="status">Initializing...</div>
+<div id="log"></div>
+
+<script>
+    (() => {
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+
+        function log(msg, cls = '') {
+            const t = new Date().toISOString().substr(11, 12);
+            const line = document.createElement('div');
+            line.className = cls;
+            line.textContent = `[${t}] ${msg}`;
+            logEl.appendChild(line);
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(msg);
+        }
+
+        function setStatus(msg, cls = '') {
+            statusEl.textContent = msg;
+            statusEl.className = cls;
+        }
+
+        const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsScheme}://${location.host}/ws`;
+        log(`Connecting to ${wsUrl}`);
+
+        const ws = new WebSocket(wsUrl);
+        let pc = null;
+
+        ws.onopen = () => {
+            setStatus('Connected, waiting for SDP offer...', 'ok');
+            log('WS open', 'ok');
+        };
+        ws.onerror = (e) => {
+            setStatus('WebSocket error', 'error');
+            log(`WS error: ${e.message || e}`, 'error');
+        };
+        ws.onclose = (e) => {
+            log(`WS closed: code=${e.code} reason=${e.reason || '-'}`, 'warn');
+            if (pc) { pc.close(); pc = null; }
+            setStatus('WebSocket closed', 'error');
+        };
+
+        ws.onmessage = async (evt) => {
+            let msg;
+            try { msg = JSON.parse(evt.data); }
+            catch { log(`Non-JSON: ${evt.data}`, 'warn'); return; }
+
+            log(`<- ${msg.type}`);
+
+            if (msg.type === 'offer') await handleOffer(msg.sdp);
+            else if (msg.type === 'ice') await handleRemoteIce(msg);
+            else if (msg.type === 'error') {
+                setStatus(`Server error: ${msg.message}`, 'error');
+                log(`Server error: ${msg.message}`, 'error');
+            } else log(`Unknown message type: ${msg.type}`, 'warn');
+        };
+
+        async function handleOffer(sdp) {
+            log(`Received offer (${sdp.length} bytes)`);
+
+            if (!pc) {
+                pc = new RTCPeerConnection({
+                    iceServers: [
+                        // For LAN only — no STUN needed.
+                        // For NAT: { urls: 'stun:stun.l.google.com:19302' }
+                    ],
+                });
+
+                pc.ontrack = (e) => {
+                    log(`ontrack: kind=${e.track.kind} streams=${e.streams.length}`, 'ok');
+                    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+                    video.play().catch(err => log(`video.play() failed: ${err}`, 'warn'));
+                };
+
+                pc.onicecandidate = (e) => {
+                    if (e.candidate) {
+                        log(`Local ICE: ${e.candidate.candidate}`);
+                        ws.send(JSON.stringify({
+                            type: 'ice',
+                            sdpMLineIndex: e.candidate.sdpMLineIndex,
+                            candidate: e.candidate.candidate,
+                        }));
+                    } else log('Local ICE gathering complete');
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                    const s = pc.iceConnectionState;
+                    log(`ICE state: ${s}`, (s === 'connected' || s === 'completed') ? 'ok' : '');
+                };
+                pc.onconnectionstatechange = () => {
+                    const s = pc.connectionState;
+                    log(`PC state: ${s}`, s === 'connected' ? 'ok' : '');
+                    if (s === 'failed') setStatus('Peer connection failed', 'error');
+                };
+                pc.onsignalingstatechange = () => log(`Signaling state: ${pc.signalingState}`);
+                pc.onicegatheringstatechange = () => log(`ICE gathering state: ${pc.iceGatheringState}`);
+            }
+
+            try {
+                setStatus('Setting remote description...');
+                await pc.setRemoteDescription({ type: 'offer', sdp });
+                log('Remote description set', 'ok');
+            } catch (err) {
+                setStatus(`setRemoteDescription failed: ${err.name}`, 'error');
+                log(`setRemoteDescription failed: ${err.name}: ${err.message}`, 'error');
+                return;
+            }
+
+            let answer;
+            try {
+                setStatus('Creating answer...');
+                answer = await pc.createAnswer();
+                log(`Answer created (${answer.sdp.length} bytes)`, 'ok');
+            } catch (err) {
+                setStatus(`createAnswer failed: ${err.name}`, 'error');
+                log(`createAnswer failed: ${err.name}: ${err.message}`, 'error');
+                return;
+            }
+
+            try {
+                await pc.setLocalDescription(answer);
+                log('Local description set', 'ok');
+            } catch (err) {
+                setStatus(`setLocalDescription failed: ${err.name}`, 'error');
+                log(`setLocalDescription failed: ${err.name}: ${err.message}`, 'error');
+                return;
+            }
+
+            log('Sending answer');
+            ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+            setStatus('Answer sent, waiting for media...', 'ok');
+        }
+
+        async function handleRemoteIce(msg) {
+            if (!pc) { log('ICE before offer; ignoring', 'warn'); return; }
+            try {
+                await pc.addIceCandidate({
+                    candidate: msg.candidate,
+                    sdpMLineIndex: msg.sdpMLineIndex,
+                });
+                log(`Remote ICE added: ${String(msg.candidate).substr(0, 60)}...`);
+            } catch (err) {
+                log(`addIceCandidate failed: ${err.name}: ${err.message}`, 'error');
+            }
+        }
+
+        // Periodic stats — помогает отличить "connected but black" от "not connected".
+        setInterval(async () => {
+            if (!pc || pc.connectionState !== 'connected') return;
+            try {
+                const stats = await pc.getStats();
+                let inbound = null;
+                stats.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') inbound = r; });
+                if (inbound) {
+                    log(`stats: bytes=${inbound.bytesReceived} frames=${inbound.framesDecoded} ` +
+                        `${inbound.frameWidth}x${inbound.frameHeight} keyframes=${inbound.keyFramesDecoded}`);
+                }
+            } catch {}
+        }, 3000);
+    })();
+</script>
+</body>
+</html>

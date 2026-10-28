@@ -1,0 +1,24 @@
+FormatStyle: google
+Checks: '
+bugprone-*,
+cert-*,
+clang-analyzer-*,
+concurrency-*,
+cppcoreguidelines-*,
+misc-*,
+modernize-*,
+performance-*,
+portability*,
+readability-*,
+-readability-magic-numbers,
+-modernize-use-trailing-return-type,
+-readability-braces-around-statements,
+-readability-identifier-length,
+-cppcoreguidelines-avoid-const-or-ref-data-members,
+-cppcoreguidelines-pro-bounds-avoid-unchecked-container-access,
+-cppcoreguidelines-pro-bounds-pointer-arithmetic,
+-cppcoreguidelines-pro-type-vararg,
+-cppcoreguidelines-special-member-functions,
+'
+WarningsAsErrors: '*'
+HeaderFilterRegex: ''
