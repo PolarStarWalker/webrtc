@@ -1,6 +1,16 @@
-// Заголовок WebRTC-API из gst-plugins-bad помечен как unstable; define
-// должен идти до любых gst/*.h включений, иначе -Werror=cpp сработает.
-#define GST_USE_UNSTABLE_API
+// WebRTC PoC streaming server — single-file, C++26 (GCC 16.2).
+//
+// Слои:
+//   1. VideoStreamer   — камера + GStreamer + GLib-цикл (только его забота).
+//   2. WebRTCWebSocket — signaling: JSON ↔ методы стримера.
+//
+// Жизненные циклы:
+//   • VideoStreamer — на стеке в main(), живёт всё время работы приложения.
+//   • WebRTCWebSocket — по одному на WS-соединение (создаётся Drogon'ом
+//     через лямбду в registerWebSocketController), хранит VideoStreamer&.
+//   • Никакого глобального/статического состояния приложения.
+
+#define GST_USE_UNSTABLE_API  // ОБЯЗАТЕЛЬНО до любых gst/*.h
 
 #include <drogon/WebSocketController.h>
 #include <drogon/drogon.h>
@@ -15,6 +25,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <expected>
@@ -29,10 +40,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // =============================================================================
-// Сообщения
+// Signaling protocol
 // =============================================================================
 
 namespace {
@@ -72,41 +84,41 @@ struct std::formatter<MessageType> : std::formatter<std::string_view> {
 namespace {
 
 // =============================================================================
-// JSON helpers (jsoncpp, встроенный в Drogon)
+// JSON helpers
 // =============================================================================
 
 std::string JsonDump(const Json::Value& value) {
-    Json::StreamWriterBuilder writer;
-    writer["indentation"] = "";
-    writer["emitUTF8"] = true;
-    auto result = Json::writeString(writer, value);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) result.pop_back();
-    return result;
+    Json::StreamWriterBuilder w;
+    w["indentation"] = "";
+    w["emitUTF8"] = true;
+    auto s = Json::writeString(w, value);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
 }
 
 std::optional<Json::Value> JsonParse(std::string_view text) {
-    Json::CharReaderBuilder reader;
-    reader["collectComments"] = false;
-    std::string errors;
-    Json::Value value;
-    std::istringstream stream{std::string(text)};
-    if (!Json::parseFromStream(reader, stream, &value, &errors)) return std::nullopt;
-    return value;
+    Json::CharReaderBuilder r;
+    r["collectComments"] = false;
+    std::string errs;
+    Json::Value v;
+    std::istringstream ss{std::string(text)};
+    if (!Json::parseFromStream(r, ss, &v, &errs)) return std::nullopt;
+    return v;
 }
 
-std::string JsonStr(const Json::Value& value, const char* key) {
-    if (value.isObject() && value.isMember(key) && value[key].isString()) return value[key].asString();
+std::string JsonStr(const Json::Value& v, const char* key) {
+    if (v.isObject() && v.isMember(key) && v[key].isString()) return v[key].asString();
     return {};
 }
 
-int JsonInt(const Json::Value& value, const char* key, int defaultValue = 0) {
-    if (value.isObject() && value.isMember(key) && value[key].isNumeric()) return value[key].asInt();
-    return defaultValue;
+int JsonInt(const Json::Value& v, const char* key, int def = 0) {
+    if (v.isObject() && v.isMember(key) && v[key].isNumeric()) return v[key].asInt();
+    return def;
 }
 
-std::string Truncate(std::string_view text, size_t length = 120) {
-    if (text.size() <= length) return std::string(text);
-    return std::string(text.substr(0, length)) + "...";
+std::string Truncate(std::string_view text, size_t len = 120) {
+    if (text.size() <= len) return std::string(text);
+    return std::string(text.substr(0, len)) + "...";
 }
 
 // =============================================================================
@@ -142,16 +154,16 @@ bool DeviceSupportsH264(const std::string& path) {
 }
 
 std::vector<std::string> FindH264Cameras() {
-    std::vector<std::string> cameras;
+    std::vector<std::string> cams;
     for (int i = 0; i < 64; ++i) {
         auto path = "/dev/video" + std::to_string(i);
         if (!std::filesystem::exists(path)) continue;
         if (DeviceSupportsH264(path)) {
             std::println("[cam] {}: H.264 ✓", path);
-            cameras.push_back(path);
+            cams.push_back(path);
         }
     }
-    return cameras;
+    return cams;
 }
 
 void PrintAllCameras() {
@@ -161,13 +173,11 @@ void PrintAllCameras() {
         auto path = "/dev/video" + std::to_string(i);
         if (!std::filesystem::exists(path)) continue;
         any = true;
-
         int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
         if (fd < 0) {
             std::println(stderr, "  {}: cannot open ({})", path, std::strerror(errno));
             continue;
         }
-
         v4l2_capability cap{};
         std::string name = "<unknown>";
         if (::ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) name = reinterpret_cast<const char*>(cap.card);
@@ -180,39 +190,55 @@ void PrintAllCameras() {
             formats += reinterpret_cast<const char*>(&fmtDesc.description);
         }
         ::close(fd);
-
         std::println(stderr, "  {} [{}]: {}", path, name, formats.empty() ? "<no capture formats>" : formats);
     }
     if (!any) std::println(stderr, "  (no /dev/video* devices found)");
 }
 
 // =============================================================================
-// WebRTCSession
+// Слой 1: VideoStreamer — камера + GStreamer + свой GLib-цикл
 // =============================================================================
 
-class WebRTCSession {
+class VideoStreamer {
    public:
-    // C++26: std::copyable_function — более лёгкая замена std::function.
+    // Единственный «выход» наружу — отдать JSON клиенту.
+    // std::copyable_function — C++26.
     using SendFn = std::copyable_function<void(std::string)>;
 
-    WebRTCSession(std::string device, SendFn send) : device_(std::move(device)), send_(std::move(send)) {}
+    explicit VideoStreamer(std::string device) : device_(std::move(device)) {
+        // GLib-цикл нужен только GStreamer'у, поэтому живёт здесь.
+        // Стартуем в конструкторе — чтобы Start()/Stop() можно было
+        // переиспользовать при переподключениях без пересоздания треда.
+        loop_ = g_main_loop_new(nullptr, FALSE);
+        loopThread_ = std::thread([this] {
+            std::println("[rtc] GLib loop running");
+            g_main_loop_run(loop_);
+            std::println("[rtc] GLib loop exited");
+        });
+    }
 
-    ~WebRTCSession() {
-        std::println("[rtc] ~WebRTCSession");
-        if (webrtcBin_) g_signal_handlers_disconnect_by_data(webrtcBin_, this);
-        if (pipeline_) {
-            gst_element_set_state(pipeline_, GST_STATE_NULL);
-            gst_object_unref(pipeline_);
-            pipeline_ = nullptr;
+    ~VideoStreamer() {
+        std::println("[rtc] ~VideoStreamer");
+        Stop();  // сначала гасим pipeline, потом цикл
+        if (loop_) {
+            g_main_loop_quit(loop_);
+            if (loopThread_.joinable()) loopThread_.join();
+            g_main_loop_unref(loop_);
+            loop_ = nullptr;
         }
     }
 
-    WebRTCSession(const WebRTCSession&) = delete;
-    WebRTCSession& operator=(const WebRTCSession&) = delete;
+    VideoStreamer(const VideoStreamer&) = delete;
+    VideoStreamer& operator=(const VideoStreamer&) = delete;
 
-    std::expected<void, std::string> Start() {
-        std::println("[rtc] === Start() ===");
-        std::println("[rtc] device: {}", device_);
+    std::expected<void, std::string> Start(SendFn send) {
+        std::println("[rtc] === Start() === device={}", device_);
+
+        // Один streamer = один активный клиент. Второй получит отказ,
+        // пока первый не отключится (Stop() вызовется в handleConnectionClosed).
+        if (pipeline_) return std::unexpected("streamer already in use by another connection");
+
+        send_ = std::move(send);
 
         if (!std::filesystem::exists(device_)) return std::unexpected("device not found: " + device_);
         if (std::ifstream probe(device_); !probe)
@@ -221,28 +247,45 @@ class WebRTCSession {
         pipeline_ = gst_pipeline_new("webrtc-pipeline");
         if (!pipeline_) return std::unexpected("gst_pipeline_new failed");
 
-        auto makeElement = [](const char* factory, const char* name) -> GstElement* {
-            auto* element = gst_element_factory_make(factory, name);
-            if (!element)
-                std::println(stderr, "[rtc] !! factory_make(\"{}\") FAILED", factory);
-            else
-                std::println("[rtc] + {} ('{}')", factory, name);
-            return element;
+        // Хелпер: при ошибке — освободить pipeline (он владеет всеми
+        // добавленными элементами, включая webrtcbin) и обнулить поля.
+        auto fail = [this](std::string msg) -> std::expected<void, std::string> {
+            if (pipeline_) {
+                gst_element_set_state(pipeline_, GST_STATE_NULL);
+                gst_object_unref(pipeline_);
+                pipeline_ = nullptr;
+            }
+            webrtcBin_ = nullptr;
+            remoteDescriptionSet_ = false;
+            return std::unexpected(std::move(msg));
         };
 
-        GstElement* src = makeElement("v4l2src", "src");
-        GstElement* caps = makeElement("capsfilter", "caps");
-        GstElement* parser = makeElement("h264parse", "parser");
-        GstElement* pay = makeElement("rtph264pay", "pay");
-        GstElement* queue = makeElement("queue", "queue");
-        webrtcBin_ = makeElement("webrtcbin", "webrtcbin");
+        // Элементы сразу кладутся в bin → pipeline ими владеет на всех
+        // путях, включая early-return. Утечек нет.
+        auto add = [this](const char* factory, const char* name) -> GstElement* {
+            auto* e = gst_element_factory_make(factory, name);
+            if (!e) {
+                std::println(stderr, "[rtc] !! factory_make(\"{}\") FAILED", factory);
+                return nullptr;
+            }
+            std::println("[rtc] + {} ('{}')", factory, name);
+            gst_bin_add(GST_BIN(pipeline_), e);
+            return e;
+        };
 
-        if (!src) return std::unexpected("v4l2src missing (gstreamer1.0-plugins-good)");
-        if (!caps) return std::unexpected("capsfilter missing");
-        if (!parser) return std::unexpected("h264parse missing (gstreamer1.0-plugins-bad)");
-        if (!pay) return std::unexpected("rtph264pay missing (gstreamer1.0-plugins-good)");
-        if (!queue) return std::unexpected("queue missing");
-        if (!webrtcBin_) return std::unexpected("webrtcbin missing (vcpkg gstreamer[webrtc])");
+        GstElement* src = add("v4l2src", "src");
+        GstElement* caps = add("capsfilter", "caps");
+        GstElement* parser = add("h264parse", "parser");
+        GstElement* pay = add("rtph264pay", "pay");
+        GstElement* queue = add("queue", "queue");
+        webrtcBin_ = add("webrtcbin", "webrtcbin");
+
+        if (!src) return fail("v4l2src missing (gstreamer1.0-plugins-good)");
+        if (!caps) return fail("capsfilter missing");
+        if (!parser) return fail("h264parse missing (gstreamer1.0-plugins-bad)");
+        if (!pay) return fail("rtph264pay missing (gstreamer1.0-plugins-good)");
+        if (!queue) return fail("queue missing");
+        if (!webrtcBin_) return fail("webrtcbin missing (vcpkg gstreamer[webrtc])");
 
         g_object_set(src, "device", device_.c_str(), nullptr);
         GstCaps* videoCaps = gst_caps_from_string("video/x-h264");
@@ -251,24 +294,21 @@ class WebRTCSession {
         g_object_set(pay, "config-interval", -1, nullptr);
         g_object_set(pay, "pt", 96, nullptr);
 
-        if (!GST_IS_ELEMENT(webrtcBin_)) {
-            return std::unexpected(
+        if (!GST_IS_ELEMENT(webrtcBin_))
+            return fail(
                 "webrtcbin is not a valid GstElement "
                 "(static registration of webrtc/nice/dtls/srtp failed)");
-        }
-        gst_bin_add_many(GST_BIN(pipeline_), src, caps, parser, pay, queue, webrtcBin_, nullptr);
 
         if (!gst_element_link_many(src, caps, parser, pay, queue, webrtcBin_, nullptr))
-            return std::unexpected(
+            return fail(
                 "link failed: v4l2src ! video/x-h264 ! h264parse ! "
-                "rtph264pay ! queue ! webrtcbin  (камера не отдаёт H.264?)");
+                "rtph264pay ! queue ! webrtcbin (камера не отдаёт H.264?)");
 
         InstallBusWatch();
         ConnectWebRtcSignals();
 
-        std::println("[rtc] set_state(PLAYING)");
         auto ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
-        if (ret == GST_STATE_CHANGE_FAILURE) return std::unexpected("set_state(PLAYING) failed");
+        if (ret == GST_STATE_CHANGE_FAILURE) return fail("set_state(PLAYING) failed");
 
         std::println("[rtc] state_change ret = {}", ret == GST_STATE_CHANGE_ASYNC     ? "ASYNC"
                                                     : ret == GST_STATE_CHANGE_SUCCESS ? "SUCCESS"
@@ -276,7 +316,21 @@ class WebRTCSession {
         return {};
     }
 
+    // Идемпотентен. Не трогает GLib-цикл — он живёт всё время жизни стримера.
+    void Stop() {
+        if (!pipeline_) return;
+        std::println("[rtc] Stop()");
+        if (webrtcBin_) g_signal_handlers_disconnect_by_data(webrtcBin_, this);
+        gst_element_set_state(pipeline_, GST_STATE_NULL);
+        gst_object_unref(pipeline_);
+        pipeline_ = nullptr;
+        webrtcBin_ = nullptr;
+        remoteDescriptionSet_ = false;
+        send_ = nullptr;
+    }
+
     void SetRemoteDescription(std::string_view type, std::string_view sdpText) {
+        if (!webrtcBin_) return;
         std::println("[rtc] SetRemoteDescription type={} size={}", type, sdpText.size());
 
         if (type == "answer" && remoteDescriptionSet_) {
@@ -292,26 +346,25 @@ class WebRTCSession {
         }
 
         auto sdpType = (type == "offer") ? GST_WEBRTC_SDP_TYPE_OFFER : GST_WEBRTC_SDP_TYPE_ANSWER;
-
-        GstWebRTCSessionDescription* description = gst_webrtc_session_description_new(sdpType, sdp);
+        GstWebRTCSessionDescription* desc = gst_webrtc_session_description_new(sdpType, sdp);
 
         GstPromise* promise = gst_promise_new_with_change_func(
             [](GstPromise* p, gpointer) {
-                auto result = gst_promise_wait(p);
+                auto r = gst_promise_wait(p);
                 std::println("[rtc] set-remote-description done: {}",
-                             result == GST_PROMISE_RESULT_REPLIED ? "OK" : "NOT-REPLIED");
+                             r == GST_PROMISE_RESULT_REPLIED ? "OK" : "NOT-REPLIED");
                 gst_promise_unref(p);
             },
             nullptr, nullptr);
-        g_signal_emit_by_name(webrtcBin_, "set-remote-description", description, promise);
-        gst_webrtc_session_description_free(description);
+        g_signal_emit_by_name(webrtcBin_, "set-remote-description", desc, promise);
+        gst_webrtc_session_description_free(desc);
 
         remoteDescriptionSet_ = true;
         std::println("[rtc] remote description emitted");
     }
 
     void AddIceCandidate(int mline, std::string_view candidate) {
-        if (candidate.empty()) return;
+        if (!webrtcBin_ || candidate.empty()) return;
         std::string value(candidate);
         g_signal_emit_by_name(webrtcBin_, "add-ice-candidate", mline, value.c_str());
     }
@@ -321,37 +374,37 @@ class WebRTCSession {
         GstBus* bus = gst_element_get_bus(pipeline_);
         gst_bus_add_watch(
             bus,
-            [](GstBus*, GstMessage* message, gpointer data) -> gboolean {
-                GstElement* pipeline = static_cast<GstElement*>(data);
-                switch (GST_MESSAGE_TYPE(message)) {
+            [](GstBus*, GstMessage* msg, gpointer data) -> gboolean {
+                auto* pipeline = static_cast<GstElement*>(data);
+                switch (GST_MESSAGE_TYPE(msg)) {
                     case GST_MESSAGE_ERROR: {
-                        GError* error = nullptr;
-                        gchar* debug = nullptr;
-                        gst_message_parse_error(message, &error, &debug);
-                        std::println(stderr, "[gst] !! ERROR from {}: {}", GST_OBJECT_NAME(message->src),
-                                     error ? error->message : "?");
-                        if (debug) std::println(stderr, "[gst]    {}", debug);
-                        if (error) g_error_free(error);
-                        g_free(debug);
+                        GError* err = nullptr;
+                        gchar* dbg = nullptr;
+                        gst_message_parse_error(msg, &err, &dbg);
+                        std::println(stderr, "[gst] !! ERROR from {}: {}", GST_OBJECT_NAME(msg->src),
+                                     err ? err->message : "?");
+                        if (dbg) std::println(stderr, "[gst]    {}", dbg);
+                        if (err) g_error_free(err);
+                        g_free(dbg);
                         break;
                     }
                     case GST_MESSAGE_WARNING: {
-                        GError* error = nullptr;
-                        gchar* debug = nullptr;
-                        gst_message_parse_warning(message, &error, &debug);
-                        std::println(stderr, "[gst] WARNING from {}: {}", GST_OBJECT_NAME(message->src),
-                                     error ? error->message : "?");
-                        if (debug) std::println(stderr, "[gst]    {}", debug);
-                        if (error) g_error_free(error);
-                        g_free(debug);
+                        GError* err = nullptr;
+                        gchar* dbg = nullptr;
+                        gst_message_parse_warning(msg, &err, &dbg);
+                        std::println(stderr, "[gst] WARNING from {}: {}", GST_OBJECT_NAME(msg->src),
+                                     err ? err->message : "?");
+                        if (dbg) std::println(stderr, "[gst]    {}", dbg);
+                        if (err) g_error_free(err);
+                        g_free(dbg);
                         break;
                     }
                     case GST_MESSAGE_STATE_CHANGED:
-                        if (GST_MESSAGE_SRC(message) == GST_OBJECT(pipeline)) {
-                            GstState oldState, newState, pending;
-                            gst_message_parse_state_changed(message, &oldState, &newState, &pending);
-                            std::println("[gst] pipeline {} -> {} (pending {})", gst_element_state_get_name(oldState),
-                                         gst_element_state_get_name(newState), gst_element_state_get_name(pending));
+                        if (GST_MESSAGE_SRC(msg) == GST_OBJECT(pipeline)) {
+                            GstState o, n, p;
+                            gst_message_parse_state_changed(msg, &o, &n, &p);
+                            std::println("[gst] pipeline {} -> {} (pending {})", gst_element_state_get_name(o),
+                                         gst_element_state_get_name(n), gst_element_state_get_name(p));
                         }
                         break;
                     case GST_MESSAGE_EOS:
@@ -367,31 +420,31 @@ class WebRTCSession {
     }
 
     void ConnectWebRtcSignals() {
-        g_signal_connect(webrtcBin_, "on-negotiation-needed", G_CALLBACK(&WebRTCSession::OnNegotiationNeeded), this);
-        g_signal_connect(webrtcBin_, "on-ice-candidate", G_CALLBACK(&WebRTCSession::OnIceCandidate), this);
-        g_signal_connect(webrtcBin_, "pad-added", G_CALLBACK(&WebRTCSession::OnPadAdded), this);
+        g_signal_connect(webrtcBin_, "on-negotiation-needed", G_CALLBACK(&VideoStreamer::OnNegotiationNeeded), this);
+        g_signal_connect(webrtcBin_, "on-ice-candidate", G_CALLBACK(&VideoStreamer::OnIceCandidate), this);
+        g_signal_connect(webrtcBin_, "pad-added", G_CALLBACK(&VideoStreamer::OnPadAdded), this);
     }
 
-    static void OnNegotiationNeeded(GstElement* webrtc, gpointer data) {
+    static void OnNegotiationNeeded(GstElement* w, gpointer data) {
         std::println("[rtc] << on-negotiation-needed >>");
-        GstPromise* promise = gst_promise_new_with_change_func(&WebRTCSession::OnOfferCreated,
-                                                               static_cast<WebRTCSession*>(data), nullptr);
-        g_signal_emit_by_name(webrtc, "create-offer", nullptr, promise);
+        auto* promise = gst_promise_new_with_change_func(&VideoStreamer::OnOfferCreated, data, nullptr);
+        g_signal_emit_by_name(w, "create-offer", nullptr, promise);
     }
 
     static void OnIceCandidate(GstElement*, guint mline, gchar* candidate, gpointer data) {
-        auto* self = static_cast<WebRTCSession*>(data);
+        auto* self = static_cast<VideoStreamer*>(data);
         if (!candidate) {
             std::println("[rtc] local ICE end-of-candidates (mline={})", mline);
             return;
         }
+        if (!self->send_) return;
         std::println("[rtc] local ICE mline={} cand={}", mline, candidate);
 
-        Json::Value message;
-        message["type"] = std::format("{}", MessageType::Ice);
-        message["sdpMLineIndex"] = static_cast<Json::UInt>(mline);
-        message["candidate"] = std::string(candidate);
-        self->send_(JsonDump(message));
+        Json::Value m;
+        m["type"] = std::format("{}", MessageType::Ice);
+        m["sdpMLineIndex"] = static_cast<Json::UInt>(mline);
+        m["candidate"] = std::string(candidate);
+        self->send_(JsonDump(m));
     }
 
     static void OnPadAdded(GstElement*, GstPad* pad, gpointer) {
@@ -399,7 +452,7 @@ class WebRTCSession {
     }
 
     static void OnOfferCreated(GstPromise* promise, gpointer data) {
-        auto* self = static_cast<WebRTCSession*>(data);
+        auto* self = static_cast<VideoStreamer*>(data);
         std::println("[rtc] << on-offer-created >>");
 
         if (gst_promise_wait(promise) != GST_PROMISE_RESULT_REPLIED) {
@@ -414,31 +467,30 @@ class WebRTCSession {
             gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr);
         }
 
-        if (offer) {
+        if (offer && self->webrtcBin_ && self->send_) {
             gchar* sdp = gst_sdp_message_as_text(offer->sdp);
-            std::string sdpString = sdp ? sdp : "";
+            std::string sdpStr = sdp ? sdp : "";
             g_free(sdp);
 
-            std::println("[rtc] sending offer ({}b)", sdpString.size());
-            Json::Value message;
-            message["type"] = std::format("{}", MessageType::Offer);
-            message["sdp"] = std::move(sdpString);
-            self->send_(JsonDump(message));
+            std::println("[rtc] sending offer ({}b)", sdpStr.size());
+            Json::Value m;
+            m["type"] = std::format("{}", MessageType::Offer);
+            m["sdp"] = std::move(sdpStr);
+            self->send_(JsonDump(m));
 
-            GstPromise* localPromise = gst_promise_new_with_change_func(
+            GstPromise* lp = gst_promise_new_with_change_func(
                 [](GstPromise* p, gpointer) {
-                    auto result = gst_promise_wait(p);
+                    auto r = gst_promise_wait(p);
                     std::println("[rtc] set-local-description done: {}",
-                                 result == GST_PROMISE_RESULT_REPLIED ? "OK" : "NOT-REPLIED");
+                                 r == GST_PROMISE_RESULT_REPLIED ? "OK" : "NOT-REPLIED");
                     gst_promise_unref(p);
                 },
                 nullptr, nullptr);
-            g_signal_emit_by_name(self->webrtcBin_, "set-local-description", offer, localPromise);
-            gst_webrtc_session_description_free(offer);
+            g_signal_emit_by_name(self->webrtcBin_, "set-local-description", offer, lp);
         } else {
-            std::println(stderr, "[rtc] offer is null in reply");
+            std::println(stderr, "[rtc] offer is null, or pipeline already stopped");
         }
-
+        if (offer) gst_webrtc_session_description_free(offer);
         gst_promise_unref(promise);
     }
 
@@ -447,127 +499,57 @@ class WebRTCSession {
     GstElement* pipeline_ = nullptr;
     GstElement* webrtcBin_ = nullptr;
     bool remoteDescriptionSet_ = false;
+
+    // GLib-цикл — только забота VideoStreamer'а.
+    GMainLoop* loop_ = nullptr;
+    std::thread loopThread_;
 };
 
 // =============================================================================
-// main helpers
+// Слой 2: WebRTCWebSocket — signaling
 // =============================================================================
+//
+// Владеет ссылкой на VideoStreamer (не shared_ptr!). Экземпляр
+// создаётся Drogon'ом per-connection через лямбду в main().
+// Макросы WS_PATH_LIST_* намеренно не используются — они предполагают
+// конструктор по умолчанию и дублировали бы /ws при явной регистрации.
 
-struct GLibLoop {
-    GMainLoop* loop = nullptr;
-    std::thread thread;
-
-    GLibLoop() {
-        loop = g_main_loop_new(nullptr, FALSE);
-        thread = std::thread([this] { g_main_loop_run(loop); });
-    }
-    ~GLibLoop() {
-        if (loop) g_main_loop_quit(loop);
-        if (thread.joinable()) thread.join();
-        if (loop) g_main_loop_unref(loop);
-    }
-    GLibLoop(const GLibLoop&) = delete;
-    GLibLoop& operator=(const GLibLoop&) = delete;
-};
-
-std::string SelectCamera() {
-    if (const char* env = std::getenv("WEBRTC_CAMERA"); env && *env) {
-        std::string camera = env;
-        std::println("Using camera from WEBRTC_CAMERA: {}", camera);
-        if (!std::filesystem::exists(camera)) {
-            std::println(stderr, "!! {} does not exist", camera);
-            return {};
-        }
-        if (!DeviceSupportsH264(camera)) {
-            std::println(stderr, "!! {} is not H.264-capable; passthrough pipeline will fail", camera);
-        }
-        return camera;
-    }
-
-    auto cameras = FindH264Cameras();
-    if (cameras.empty()) {
-        std::println(stderr,
-                     "\nNo H.264-capable camera found.\n"
-                     "Passthrough needs a camera that outputs raw H.264 over V4L2.\n\n");
-        PrintAllCameras();
-        std::println(stderr,
-                     "\nOptions:\n"
-                     "  1. Connect a camera that outputs H.264 "
-                     "(Logitech C920/C922, most industrial cams).\n"
-                     "  2. Force a specific device: WEBRTC_CAMERA=/dev/videoN ./webrtc\n"
-                     "     (pipeline will fail unless that device really does H.264).\n"
-                     "  3. Switch pipeline to transcode MJPEG/YUYV → H.264 "
-                     "(decode + x264enc / v4l2h264enc).\n");
-        return {};
-    }
-
-    std::println("H.264 camera(s) found:");
-    for (auto& camera : cameras) std::println("  {}", camera);
-    std::println("Using: {}", cameras.front());
-    return cameras.front();
-}
-
-std::string LoadIndexHtml() {
-    for (auto* path : {"index.html", "static/index.html", "scripts/static/index.html"}) {
-        if (std::filesystem::exists(path)) {
-            std::ifstream file(path);
-            std::string content{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            std::println("Serving index from: {} ({}b)", path, content.size());
-            return content;
-        }
-    }
-    std::println(stderr,
-                 "!! index.html not found near CWD. Returning stub. "
-                 "CMake should have copied it into build-dir.");
-    return "<h1>index.html not found</h1>";
-}
-
-}  // namespace
-
-// =============================================================================
-// WebRTCWebSocket — WebSocket-контроллер Drogon
-// =============================================================================
-
-class WebRTCWebSocket : public drogon::WebSocketController<WebRTCWebSocket> {
+class WebRTCWebSocket : public drogon::WebSocketController<WebRTCWebSocket, false> {
    public:
-    static void SetCamera(std::string camera) { camera_ = std::move(camera); }
+    explicit WebRTCWebSocket(VideoStreamer& streamer) : streamer_(streamer) {}
+
+    WS_PATH_LIST_BEGIN
+    WS_PATH_ADD("/ws");
+    WS_PATH_LIST_END
 
     void handleNewConnection(const drogon::HttpRequestPtr&, const drogon::WebSocketConnectionPtr& conn) override {
         std::println("[ws] === SESSION START ===");
 
-        // ВАЖНО: send() нельзя вызывать из потока GStreamer напрямую.
-        // Все отправки заворачиваем в event loop Drogon через queueInLoop.
-        // weak_ptr разрывает цикл conn -> context -> WebRTCSession -> send_ -> conn.
+        // weak_ptr разрывает цикл conn → send → conn.
+        // queueInLoop — отправка строго из loop'а Drogon, а не из GStreamer-треда.
         std::weak_ptr<drogon::WebSocketConnection> weakConn = conn;
-        auto send = [weakConn](std::string message) {
-            drogon::app().getLoop()->queueInLoop([weakConn, message = std::move(message)]() mutable {
+        auto send = [weakConn](std::string msg) {
+            drogon::app().getLoop()->queueInLoop([weakConn, msg = std::move(msg)]() mutable {
                 if (auto locked = weakConn.lock(); locked && locked->connected()) {
-                    std::println("[ws] -> {}b: {}", message.size(), Truncate(message));
-                    locked->send(std::move(message));
+                    std::println("[ws] -> {}b: {}", msg.size(), Truncate(msg));
+                    locked->send(std::move(msg));
                 }
             });
         };
 
-        auto rtc = std::make_shared<WebRTCSession>(camera_, std::move(send));
-        conn->setContext(rtc);  // shared_ptr<WebRTCSession> -> shared_ptr<void> неявно
-
-        if (auto result = rtc->Start(); !result) {
-            std::println(stderr, "[ws] !! Start FAILED: {}", result.error());
-            Json::Value errorMessage;
-            errorMessage["type"] = std::format("{}", MessageType::Error);
-            errorMessage["message"] = result.error();
-            conn->send(JsonDump(errorMessage));
-            conn->setContext(std::shared_ptr<void>{});
+        if (auto r = streamer_.Start(std::move(send)); !r) {
+            std::println(stderr, "[ws] !! Start FAILED: {}", r.error());
+            Json::Value err;
+            err["type"] = std::format("{}", MessageType::Error);
+            err["message"] = r.error();
+            conn->send(JsonDump(err));
             conn->shutdown();
-        } else {
-            std::println("[ws] pipeline started; waiting for answer/ice");
         }
     }
 
     void handleNewMessage(const drogon::WebSocketConnectionPtr& conn, std::string&& message,
                           const drogon::WebSocketMessageType& type) override {
         if (type != drogon::WebSocketMessageType::Text) return;
-
         std::println("[ws] <- {}b: {}", message.size(), Truncate(message));
 
         auto parsed = JsonParse(message);
@@ -577,41 +559,82 @@ class WebRTCWebSocket : public drogon::WebSocketController<WebRTCWebSocket> {
         }
         const Json::Value& msg = *parsed;
 
-        // getContext<T>() возвращает std::shared_ptr<T> по значению.
-        auto rtc = conn->getContext<WebRTCSession>();
-        if (!rtc) return;
-
-        auto messageType = JsonStr(msg, "type");
-        if (messageType == "answer") {
+        auto mt = JsonStr(msg, "type");
+        if (mt == "answer") {
             auto sdp = JsonStr(msg, "sdp");
             std::println("[ws] applying answer ({}b)", sdp.size());
-            rtc->SetRemoteDescription("answer", sdp);
-        } else if (messageType == "ice") {
-            rtc->AddIceCandidate(JsonInt(msg, "sdpMLineIndex"), JsonStr(msg, "candidate"));
-        } else if (messageType == "ping") {
+            streamer_.SetRemoteDescription("answer", sdp);
+        } else if (mt == "ice") {
+            streamer_.AddIceCandidate(JsonInt(msg, "sdpMLineIndex"), JsonStr(msg, "candidate"));
+        } else if (mt == "ping") {
             Json::Value pong;
             pong["type"] = std::format("{}", MessageType::Pong);
             conn->send(JsonDump(pong));
         } else {
-            std::println(stderr, "[ws] !! unknown type: {}", messageType);
+            std::println(stderr, "[ws] !! unknown type: {}", mt);
         }
     }
 
-    void handleConnectionClosed(const drogon::WebSocketConnectionPtr& conn) override {
+    void handleConnectionClosed(const drogon::WebSocketConnectionPtr&) override {
         std::println("[ws] === SESSION END ===");
-        // Сбрасываем shared_ptr<WebRTCSession> немедленно.
-        if (conn->hasContext()) {
-            conn->setContext(std::shared_ptr<void>{});
-        }
+        streamer_.Stop();
     }
-
-    WS_PATH_LIST_BEGIN
-    WS_PATH_ADD("/ws");
-    WS_PATH_LIST_END
 
    private:
-    inline static std::string camera_;
+    VideoStreamer& streamer_;
 };
+
+// =============================================================================
+// main helpers
+// =============================================================================
+
+std::string SelectCamera() {
+    if (const char* env = std::getenv("WEBRTC_CAMERA"); env && *env) {
+        std::string cam = env;
+        std::println("Using camera from WEBRTC_CAMERA: {}", cam);
+        if (!std::filesystem::exists(cam)) {
+            std::println(stderr, "!! {} does not exist", cam);
+            return {};
+        }
+        if (!DeviceSupportsH264(cam)) std::println(stderr, "!! {} is not H.264-capable; passthrough will fail", cam);
+        return cam;
+    }
+
+    auto cams = FindH264Cameras();
+    if (cams.empty()) {
+        std::println(stderr,
+                     "\nNo H.264-capable camera found.\n"
+                     "Passthrough needs a camera that outputs raw H.264 over V4L2.\n\n");
+        PrintAllCameras();
+        std::println(stderr,
+                     "\nOptions:\n"
+                     "  1. Connect a camera that outputs H.264.\n"
+                     "  2. Force a specific device: WEBRTC_CAMERA=/dev/videoN ./webrtc\n"
+                     "  3. Switch pipeline to transcode MJPEG/YUYV -> H.264.\n");
+        return {};
+    }
+    std::println("H.264 camera(s) found:");
+    for (auto& c : cams) std::println("  {}", c);
+    std::println("Using: {}", cams.front());
+    return cams.front();
+}
+
+std::string LoadIndexHtml() {
+    for (auto* path : {"index.html", "static/index.html", "scripts/static/index.html"}) {
+        if (std::filesystem::exists(path)) {
+            std::ifstream f(path);
+            std::string c{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+            std::println("Serving index from: {} ({}b)", path, c.size());
+            return c;
+        }
+    }
+    std::println(stderr,
+                 "!! index.html not found near CWD. Returning stub. "
+                 "CMake should have copied it into build-dir.");
+    return "<h1>index.html not found</h1>";
+}
+
+}  // namespace
 
 // =============================================================================
 // main
@@ -646,27 +669,36 @@ int main() {
     GST_PLUGIN_STATIC_REGISTER(srtp);
     GST_PLUGIN_STATIC_REGISTER(udp);
 
-    GLibLoop glib;
-
     std::string camera = SelectCamera();
     if (camera.empty()) return 1;
-    WebRTCWebSocket::SetCamera(std::move(camera));
 
-    auto html = std::make_shared<std::string>(LoadIndexHtml());
-    auto serveIndex = [html](const drogon::HttpRequestPtr&,
-                             std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-        auto response = drogon::HttpResponse::newHttpResponse();
-        response->setContentTypeString("text/html; charset=utf-8");
-        response->setBody(*html);
-        callback(response);
+    // ★ VideoStreamer — стековый, один на приложение.
+    //   Контроллеры получат ссылку на него (см. лямбду ниже).
+    VideoStreamer streamer(camera);
+
+    // ★ HTML — обычная строка на стеке main. Живёт всё время работы
+    //   приложения (run() блокирующий), поэтому string_view безопасен.
+    const std::string html = LoadIndexHtml();
+    const std::string_view htmlView = html;
+
+    auto serveIndex = [htmlView](const drogon::HttpRequestPtr&,
+                                 std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setContentTypeString("text/html; charset=utf-8");
+        resp->setBody(std::string{htmlView});  // drogon копирует внутрь response
+        cb(resp);
     };
 
     std::println("HTTP/WS on http://0.0.0.0:8888");
 
+    // ★ Ручная регистрация. Inline-лямбда захватывает streamer по ссылке,
+    //   внутри создаётся shared_ptr<WebRTCWebSocket> — ровно там, где это
+    //   нужно Drogon'у. Никаких отдельных wsBinder-переменных.
     drogon::app()
         .addListener("0.0.0.0", 8888)
         .registerHandler("/", serveIndex)
         .registerHandler("/index.html", serveIndex)
+        .registerController(std::make_shared<WebRTCWebSocket>(streamer))
         .run();
 
     std::println("Bye");
