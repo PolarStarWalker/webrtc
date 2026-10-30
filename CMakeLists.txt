@@ -43,8 +43,7 @@ pkg_search_module(gstvideoconvertscale REQUIRED IMPORTED_TARGET gstvideoconverts
 pkg_search_module(gstnice REQUIRED IMPORTED_TARGET gstnice)
 pkg_search_module(gstudp REQUIRED IMPORTED_TARGET gstudp)
 
-find_package(Boost REQUIRED COMPONENTS system)
-find_package(nlohmann_json CONFIG REQUIRED)
+find_package(Drogon CONFIG REQUIRED)
 
 # Интерфейсный таргет для группировки всех GStreamer-зависимостей
 add_library(gstreamer_deps INTERFACE)
@@ -72,8 +71,7 @@ target_link_libraries(gstreamer_deps INTERFACE
 add_executable(webrtc)
 target_link_libraries(webrtc PRIVATE
         gstreamer_deps
-        Boost::system
-        nlohmann_json::nlohmann_json
+        Drogon::Drogon
 )
 
 add_subdirectory(src)
