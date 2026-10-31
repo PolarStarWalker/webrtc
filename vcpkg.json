@@ -10,10 +10,23 @@
         "plugins-bad",
         "webrtc",
         "dtls",
-        "srtp"
+        "srtp",
+        "libav"
       ]
     },
     "libnice-gst",
-    "drogon"
+    "drogon",
+    {
+      "name": "imgui",
+      "features": [
+        "docking-experimental",
+        "opengl3-binding",
+        "glfw-binding"
+      ]
+    },
+    "glfw3",
+    "glew",
+    "ixwebsocket",
+    "nlohmann-json"
   ]
 }
