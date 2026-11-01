@@ -7,4 +7,5 @@ target_sources(webrtc
         Camera.cppm
         VideoStreamer.cppm
         WebRTCWebSocket.cppm
+        WebRTCSession.cppm
 )

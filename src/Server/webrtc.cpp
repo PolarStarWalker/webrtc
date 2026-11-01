@@ -26,8 +26,7 @@ std::string LoadIndexHtml() {
     for (auto* path : {"index.html", "static/index.html", "scripts/static/index.html"}) {
         if (std::filesystem::exists(path)) {
             std::ifstream f(path);
-            std::string c{std::istreambuf_iterator<char>(f),
-                          std::istreambuf_iterator<char>()};
+            std::string c{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
             std::println("Serving index from: {} ({}b)", path, c.size());
             return c;
         }
@@ -69,12 +68,16 @@ int main() {
     GST_PLUGIN_STATIC_REGISTER(srtp);
     GST_PLUGIN_STATIC_REGISTER(udp);
 
-    std::string camera = SelectCamera();
+    const std::string camera = SelectCamera();
     if (camera.empty()) return 1;
 
     VideoStreamer streamer(camera);
+    if (auto r = streamer.Start(); !r) {
+        std::println(stderr, "!! Failed to start shared pipeline: {}", r.error());
+        return 1;
+    }
 
-    const std::string      html     = LoadIndexHtml();
+    const std::string html = LoadIndexHtml();
     const std::string_view htmlView = html;
 
     auto serveIndex = [htmlView](const drogon::HttpRequestPtr&,
