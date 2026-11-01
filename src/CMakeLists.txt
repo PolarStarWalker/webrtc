@@ -1,6 +1,5 @@
-target_sources(webrtc PRIVATE
-        webrtc.cpp
-)
+add_subdirectory(Server)
+
 
 target_sources(client
         PRIVATE client.cpp
