@@ -39,8 +39,6 @@ export class WebRTCVideoStream {
         bool valid() const noexcept { return texture != 0 && width > 0 && height > 0; }
     };
 
-    // signaling_uri — полный ws://host:port/path
-    // share_window — ваше главное окно GLFW (для shared-context)
     WebRTCVideoStream(std::string signaling_uri, GLFWwindow* share_window);
     ~WebRTCVideoStream();
 
@@ -50,12 +48,8 @@ export class WebRTCVideoStream {
     void start();
     void stop();
 
-    // Захватить мьютекс на время ImGui::Image(...) → glFinish().
     std::mutex& render_mutex();
-
-    // Валиден только пока держите render_mutex().
     FrameView current_frame();
-
     std::string last_error() const;
 
    private:
@@ -124,7 +118,6 @@ struct WebRTCVideoStream::Impl {
         }
         gst_caps_unref(caps);
 
-        // Линкуем webrtcbin.src_* → rtph264depay.sink (первый элемент после webrtcbin)
         GstElement* depay = gst_bin_get_by_name(GST_BIN(self->pipeline), "depay");
         if (!depay) {
             self->set_error("no depay element");
@@ -222,7 +215,6 @@ struct WebRTCVideoStream::Impl {
         gst_webrtc_session_description_free(offer);
         std::fprintf(stderr, "[stream] remote offer set\n");
 
-        // create-answer
         GstPromise* p2 = gst_promise_new();
         g_signal_emit_by_name(webrtc, "create-answer", nullptr, p2);
         gst_promise_wait(p2);
@@ -242,13 +234,11 @@ struct WebRTCVideoStream::Impl {
             return;
         }
 
-        // set-local-description
         GstPromise* p3 = gst_promise_new();
         g_signal_emit_by_name(webrtc, "set-local-description", answer, p3);
         gst_promise_wait(p3);
         gst_promise_unref(p3);
 
-        // Отправить answer
         gchar* sdp_out = gst_sdp_message_as_text(answer->sdp);
         json j;
         j["type"] = "answer";
@@ -261,7 +251,6 @@ struct WebRTCVideoStream::Impl {
     }
 
     void handle_answer(const std::string& sdp_text) {
-        // По схеме мы answerer, но на всякий случай
         GstSDPMessage* sdp = nullptr;
         if (gst_sdp_message_new_from_text(sdp_text.c_str(), &sdp) != GST_SDP_OK) return;
         GstWebRTCSessionDescription* ans = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
@@ -282,11 +271,8 @@ struct WebRTCVideoStream::Impl {
     }
 
     void video_main() {
-        // Свой контекст (shared с главным окном)
         glfwMakeContextCurrent(gl_window);
 
-        // GLEW уже инициализирован главным потоком; функции — process-global.
-        // Текстуру создаём в своём контексте.
         glGenTextures(1, &texture);
         glBindTexture(GL_TEXTURE_2D, texture);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -300,7 +286,7 @@ struct WebRTCVideoStream::Impl {
 
         while (running) {
             GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appsink), kTimeout);
-            if (!sample) continue;  // таймаут или EOS — проверим running
+            if (!sample) continue;
 
             GstBuffer* buf = gst_sample_get_buffer(sample);
             GstCaps* caps = gst_sample_get_caps(sample);
@@ -341,7 +327,6 @@ struct WebRTCVideoStream::Impl {
             gst_sample_unref(sample);
         }
 
-        // Чистим в своём контексте
         glDeleteTextures(1, &texture);
         texture = 0;
         glfwMakeContextCurrent(nullptr);
@@ -364,13 +349,28 @@ struct WebRTCVideoStream::Impl {
                 "missing GStreamer plugin "
                 "(install gstreamer1.0-plugins-{good,bad,libav})");
 
-        g_object_set(webrtc, "bundle-policy", "max-bundle", "stun-server", "stun://stun.l.google.com:19302", nullptr);
+        // ВАЖНО: bundle-policy — это enum, а не строка. Передавать "max-bundle"
+        // в g_object_set() нельзя: g_object_set() — variadic, GObject не умеет
+        // конвертировать строку в enum через этот путь, и в property уезжает
+        // мусорное значение.
+        g_object_set(webrtc, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE, "stun-server",
+                     "stun://stun.l.google.com:19302", nullptr);
 
-        GstCaps* rtp_caps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96");
-        GstPromise* tp = gst_promise_new();
-        g_signal_emit_by_name(webrtc, "add-transceiver", GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY, rtp_caps, tp);
-        gst_promise_unref(tp);
-        gst_caps_unref(rtp_caps);
+        // pre-declare трансивера для recvonly клиента не требуется: webrtcbin
+        // создаст его сам из оффера сервера (a=sendonly → мы recvonly).
+        // Если понадобится явно, современный API (GStreamer >= 1.22):
+        //
+        //   GstCaps* rtp_caps = gst_caps_from_string(
+        //       "application/x-rtp,media=video,encoding-name=H264,payload=96");
+        //   GstWebRTCRTPTransceiver* tr = nullptr;
+        //   g_signal_emit_by_name(webrtc, "add-transceiver",
+        //                         GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY,
+        //                         rtp_caps, &tr);
+        //   if (tr) gst_object_unref(tr);
+        //   gst_caps_unref(rtp_caps);
+        //
+        // Старый promise-based вариант на GStreamer 1.28.x оставляет promise
+        // в состоянии PENDING — отсюда и warning из gst_promise_free.
 
         g_object_set(appsink, "emit-signals", FALSE, "max-buffers", 2, "drop", TRUE, "sync", FALSE, nullptr);
         GstCaps* raw_caps = gst_caps_from_string("video/x-raw,format=RGBA");
@@ -390,7 +390,6 @@ struct WebRTCVideoStream::Impl {
     }
 
     void create_shared_gl_window() {
-        // Те же GL-hints, что и у главного окна
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -398,11 +397,10 @@ struct WebRTCVideoStream::Impl {
 
         gl_window = glfwCreateWindow(1, 1, "stream-ctx", nullptr, share_window);
 
-        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);  // восстановить дефолт
+        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
 
         if (!gl_window) throw std::runtime_error("failed to create shared GL context");
 
-        // Вернуть главный контекст на главный поток
         glfwMakeContextCurrent(share_window);
     }
 };
@@ -444,13 +442,15 @@ void WebRTCVideoStream::start() {
 
     impl_->signaling_thread = std::thread(&Impl::signaling_main, impl_.get());
 
-    // Дать GMainLoop шанс стартовать (не обязательно, но полезно)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     GstStateChangeReturn r = gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING);
     if (r == GST_STATE_CHANGE_FAILURE) {
         impl_->set_error("pipeline failed to PLAY");
         impl_->running = false;
+        // Аккуратно прибираем за собой, чтобы не остался висящий поток.
+        if (impl_->gst_loop) g_main_loop_quit(impl_->gst_loop);
+        if (impl_->signaling_thread.joinable()) impl_->signaling_thread.join();
         return;
     }
 
@@ -501,6 +501,7 @@ WebRTCVideoStream::FrameView WebRTCVideoStream::current_frame() {
 }
 
 std::string WebRTCVideoStream::last_error() const {
+    if (!impl_) return {};
     std::lock_guard lk(impl_->err_mutex);
     return impl_->last_error_;
 }
