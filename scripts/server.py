@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""WebRTC H.264 camera streaming server (GStreamer webrtcbin + aiohttp)."""
+"""WebRTC H.264 camera streaming server (GStreamer webrtcbin + aiohttp).
+
+Multi-client version: один общий pipeline читает камеру и через tee
+раздаёт поток в персональные ветки для каждого клиента.
+"""
 
 import asyncio
 import glob
@@ -78,26 +82,24 @@ def _find_index():
     return None
 
 
-# ---------- WebRTC session ----------
+# ---------- Shared pipeline (один на всех) ----------
 
-class WebRTCSession:
-    def __init__(self, ws, camera_device):
-        self.ws = ws
-        self.camera_device = camera_device
+class SharedCameraPipeline:
+    """Один pipeline читает камеру и раздаёт H.264 в N веток через tee."""
+
+    def __init__(self, device):
+        self.device = device
         self.pipeline = None
-        self.webrtcbin = None
-        self.remote_description_set = False
-        self.local_description_set = False
-        self.loop = asyncio.get_event_loop()
+        self.tee = None
 
-    def build_pipeline(self):
-        log.info("Building pipeline for %s", self.camera_device)
-        self.pipeline = Gst.Pipeline.new(f"pipeline-{id(self)}")
+    def start(self):
+        log.info("Building shared pipeline for %s", self.device)
+        self.pipeline = Gst.Pipeline.new("camera-pipeline")
 
         src = Gst.ElementFactory.make("v4l2src", "src")
         if src is None:
             raise RuntimeError("v4l2src not available")
-        src.set_property("device", self.camera_device)
+        src.set_property("device", self.device)
 
         caps = Gst.ElementFactory.make("capsfilter", "caps")
         caps.set_property("caps", Gst.Caps.from_string("video/x-h264"))
@@ -106,46 +108,158 @@ class WebRTCSession:
         if parser is None:
             raise RuntimeError("h264parse not available")
 
-        pay = Gst.ElementFactory.make("rtph264pay", "pay")
-        if pay is None:
-            raise RuntimeError(
-                "rtph264pay not available (install gstreamer1.0-plugins-good)"
-            )
-        pay.set_property("config-interval", -1)
-        pay.set_property("pt", 96)
+        pre_queue = Gst.ElementFactory.make("queue", "pre-tee-queue")
 
-        queue = Gst.ElementFactory.make("queue", "queue")
+        self.tee = Gst.ElementFactory.make("tee", "tee")
+        if self.tee is None:
+            raise RuntimeError("tee not available")
+        # Не падать, если ни один клиент ещё не подключён
+        self.tee.set_property("allow-not-linked", True)
 
-        self.webrtcbin = Gst.ElementFactory.make("webrtcbin", "webrtcbin")
-        if self.webrtcbin is None:
-            raise RuntimeError(
-                "webrtcbin not available (install gstreamer1.0-plugins-bad)"
-            )
-        self.webrtcbin.set_property("bundle-policy", "max-bundle")
-
-        for el in (src, caps, parser, pay, queue, self.webrtcbin):
+        for el in (src, caps, parser, pre_queue, self.tee):
             self.pipeline.add(el)
 
-        for a, b in (
-                (src, caps),
-                (caps, parser),
-                (parser, pay),
-                (pay, queue),
-                (queue, self.webrtcbin),
-        ):
+        for a, b in ((src, caps), (caps, parser),
+                     (parser, pre_queue), (pre_queue, self.tee)):
             if not a.link(b):
                 raise RuntimeError(
                     f"Failed to link {a.get_name()} -> {b.get_name()}"
                 )
 
-        self.webrtcbin.connect("on-negotiation-needed", self.on_negotiation_needed)
-        self.webrtcbin.connect("on-ice-candidate", self.on_ice_candidate)
-        self.webrtcbin.connect("pad-added", self.on_pad_added)
-
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Pipeline failed to start")
-        log.info("Pipeline state=PLAYING (ret=%s)", ret)
+            raise RuntimeError("Shared pipeline failed to start")
+        log.info("Shared pipeline PLAYING (ret=%s)", ret)
+
+    # ---- Жизненный цикл клиентской ветки ----
+
+    def add_consumer(self, on_negotiation_needed, on_ice_candidate, on_pad_added):
+        """Создать ветку queue → rtph264pay → queue → webrtcbin и подключить к tee.
+
+        Возвращает dict-дескриптор ветки, который потом надо передать в
+        remove_consumer(). Сигналы webrtcbin подключаются ДО перевода ветки
+        в PAUSED/PLAYING, чтобы не пропустить on-negotiation-needed.
+        """
+        q_in = Gst.ElementFactory.make("queue", None)
+        pay = Gst.ElementFactory.make("rtph264pay", None)
+        if pay is None:
+            raise RuntimeError(
+                "rtph264pay not available (install gstreamer1.0-plugins-good)"
+            )
+        pay.set_property("config-interval", -1)  # SPS/PPS перед каждым IDR
+        pay.set_property("pt", 96)
+
+        q_out = Gst.ElementFactory.make("queue", None)
+
+        webrtcbin = Gst.ElementFactory.make("webrtcbin", None)
+        if webrtcbin is None:
+            raise RuntimeError(
+                "webrtcbin not available (install gstreamer1.0-plugins-bad)"
+            )
+        webrtcbin.set_property("bundle-policy", "max-bundle")
+
+        # ВАЖНО: сигналы подключаем до set_state, иначе можем потерять
+        # первый on-negotiation-needed.
+        webrtcbin.connect("on-negotiation-needed", on_negotiation_needed)
+        webrtcbin.connect("on-ice-candidate", on_ice_candidate)
+        webrtcbin.connect("pad-added", on_pad_added)
+
+        elements = [q_in, pay, q_out, webrtcbin]
+        for el in elements:
+            self.pipeline.add(el)
+
+        for a, b in ((q_in, pay), (pay, q_out), (q_out, webrtcbin)):
+            if not a.link(b):
+                raise RuntimeError(
+                    f"Failed to link {a.get_name()} -> {b.get_name()}"
+                )
+
+        # Сначала PAUSED — безопасно привязывать к живому tee
+        for el in elements:
+            el.set_state(Gst.State.PAUSED)
+
+        if hasattr(self.tee, "request_pad_simple"):
+            tee_pad = self.tee.request_pad_simple("src_%u")
+        else:  # GStreamer < 1.20
+            tee_pad = self.tee.get_request_pad("src_%u")
+
+        if tee_pad is None:
+            raise RuntimeError("Failed to request tee src pad")
+
+        sink_pad = q_in.get_static_pad("sink")
+        if tee_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+            self.tee.release_request_pad(tee_pad)
+            raise RuntimeError("Failed to link tee -> queue")
+
+        # Теперь запускаем
+        for el in elements:
+            el.sync_state_with_parent()
+
+        return {
+            "webrtcbin": webrtcbin,
+            "tee_pad": tee_pad,
+            "elements": elements,
+        }
+
+    def remove_consumer(self, branch):
+        """Аккуратно отцепить ветку от tee и уничтожить её."""
+        tee_pad = branch["tee_pad"]
+        elements = branch["elements"]
+        q_in = elements[0]
+
+        # 1) Отлинковать от tee — дальнейшие буферы в эту ветку не пойдут
+        try:
+            sink_pad = q_in.get_static_pad("sink")
+            if sink_pad:
+                tee_pad.unlink(sink_pad)
+        except Exception as e:
+            log.error("Failed to unlink tee pad: %s", e)
+
+        # 2) Освободить request-pad
+        try:
+            self.tee.release_request_pad(tee_pad)
+        except Exception as e:
+            log.error("Failed to release tee pad: %s", e)
+
+        # 3) Погасить элементы и убрать из pipeline
+        for el in elements:
+            try:
+                el.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        for el in elements:
+            try:
+                self.pipeline.remove(el)
+            except Exception as e:
+                log.error("Failed to remove element %s: %s", el.get_name(), e)
+
+    def stop(self):
+        if self.pipeline:
+            log.info("Stopping shared pipeline")
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+
+
+# ---------- WebRTC session (по одной на клиента) ----------
+
+class WebRTCSession:
+    def __init__(self, ws, shared_pipeline):
+        self.ws = ws
+        self.shared = shared_pipeline
+        self.branch = None
+        self.webrtcbin = None
+        self.remote_description_set = False
+        self.local_description_set = False
+        self.loop = asyncio.get_event_loop()
+
+    def attach(self):
+        self.branch = self.shared.add_consumer(
+            self.on_negotiation_needed,
+            self.on_ice_candidate,
+            self.on_pad_added,
+        )
+        self.webrtcbin = self.branch["webrtcbin"]
+        log.info("Branch attached (%d elements)", len(self.branch["elements"]))
 
     # --- GStreamer signals ---
 
@@ -160,7 +274,6 @@ class WebRTCSession:
         webrtcbin.emit("create-offer", None, promise)
 
     def on_ice_candidate(self, webrtcbin, mline_index, candidate):
-        # Пустая строка = конец сбора кандидатов; можно не пересылать.
         if not candidate:
             log.debug("Local ICE mline=%d end-of-candidates", mline_index)
             return
@@ -190,8 +303,8 @@ class WebRTCSession:
         sdp_text = offer.sdp.as_text()
         log.info("Offer created (%d bytes)", len(sdp_text))
 
-        # Отправляем offer немедленно, local-description ставим асинхронно —
-        # иначе получаем deadlock на внутреннем мьютексе webrtcbin.
+        # Отправляем offer до set-local-description, иначе deadlock на
+        # внутреннем мьютексе webrtcbin.
         self._send({"type": "offer", "sdp": sdp_text})
 
         local_promise = Gst.Promise.new_with_change_func(
@@ -204,7 +317,6 @@ class WebRTCSession:
         if result != Gst.PromiseResult.REPLIED:
             log.error("set-local-description: wait result=%s", result)
             return
-        # У set-local-description NULL reply — это успех, не проверяем get_reply().
         log.info("Local description set OK")
         self.local_description_set = True
 
@@ -213,7 +325,6 @@ class WebRTCSession:
         if result != Gst.PromiseResult.REPLIED:
             log.error("set-remote-description: wait result=%s", result)
             return
-        # То же: NULL reply — успех.
         log.info("Remote description applied OK")
         self.remote_description_set = True
 
@@ -227,7 +338,6 @@ class WebRTCSession:
             return
 
         ret, sdp_msg = GstSdp.SDPMessage.new_from_text(sdp_text)
-        # ФИКС: ret == OK (0) — успех, а не провал. not OK → ошибка.
         if ret != GstSdp.SDPResult.OK:
             log.error("Failed to parse SDP (result=%s): %r", ret, sdp_text[:200])
             return
@@ -267,10 +377,11 @@ class WebRTCSession:
             log.error("WS send failed: %s", e)
 
     def close(self):
-        if self.pipeline:
-            log.info("Stopping pipeline")
-            self.pipeline.set_state(Gst.State.NULL)
-            self.pipeline = None
+        if self.branch:
+            log.info("Detaching client branch")
+            self.shared.remove_consumer(self.branch)
+            self.branch = None
+            self.webrtcbin = None
 
 
 # ---------- HTTP handlers ----------
@@ -280,10 +391,10 @@ async def ws_handler(request):
     await ws.prepare(request)
 
     log.info("Client connected: %s", request.remote)
-    session = WebRTCSession(ws, request.app["camera_device"])
+    session = WebRTCSession(ws, request.app["shared_pipeline"])
 
     try:
-        session.build_pipeline()
+        session.attach()
     except Exception as e:
         log.exception("Pipeline setup failed")
         await ws.send_str(json.dumps({"type": "error", "message": str(e)}))
@@ -376,11 +487,25 @@ def main():
         for p in _index_candidates():
             log.warning("  проверено: %s", os.path.abspath(p))
 
+    # Общий pipeline — один на весь сервер
+    shared = SharedCameraPipeline(cam)
+    try:
+        shared.start()
+    except Exception:
+        log.exception("Failed to start shared pipeline")
+        sys.exit(1)
+
     app = web.Application()
     app["camera_device"] = cam
+    app["shared_pipeline"] = shared
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/static/{path:.*}", make_static_handler())
+
+    async def _cleanup(app):
+        shared.stop()
+
+    app.on_cleanup.append(_cleanup)
 
     log.info("HTTP/WebSocket: http://%s:%d", HTTP_HOST, HTTP_PORT)
     web.run_app(app, host=HTTP_HOST, port=HTTP_PORT)
